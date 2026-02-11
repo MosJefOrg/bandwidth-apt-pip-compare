@@ -1,0 +1,143 @@
+name: Bandwidth test (apt + pip) across runners
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  measure:
+    name: Measure (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-22.04-arm
+
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Measure APT (package downloads) and PIP download speeds
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          outdir="bandwidth-results"
+          mkdir -p "$outdir"
+
+          # Pick packages that are usually NOT preinstalled on GitHub-hosted runners,
+          # so "download-only install" actually downloads .deb payloads.
+          #
+          # If you find these are already present in your environment, swap to e.g.
+          # ("linux-tools-common" "linux-tools-generic" "clang" "lld").
+          APT_PACKAGES=("clang" "cmake" "ninja-build" "pkg-config")
+          PIP_PACKAGES=("requests==2.31.0" "numpy==1.26.4" "cryptography==42.0.2")
+
+          # ---------- APT measurement (package downloads) ----------
+          # Clean first so counting /var/cache/apt/archives/*.deb reflects THIS run.
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get clean
+          sudo rm -f /var/cache/apt/archives/*.deb || true
+
+          apt_update_start="$(date +%s.%N)"
+          sudo -E apt-get update -y
+          apt_update_end="$(date +%s.%N)"
+          apt_update_seconds="$(S="$apt_update_start" E="$apt_update_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
+
+          # Download-only install (-d). This fetches .deb files without installing.
+          apt_download_start="$(date +%s.%N)"
+          sudo -E apt-get -y -d install "${APT_PACKAGES[@]}"
+          apt_download_end="$(date +%s.%N)"
+          apt_download_seconds="$(S="$apt_download_start" E="$apt_download_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
+
+          # Sum bytes of downloaded .deb files
+          apt_bytes="$(python -c 'import glob,os; print(sum(os.path.getsize(f) for f in glob.glob("/var/cache/apt/archives/*.deb") if os.path.isfile(f)))')"
+          apt_mbps="$(B="$apt_bytes" S="$apt_download_seconds" python -c 'import os; b=float(os.environ["B"]); s=float(os.environ["S"]); print((b*8.0)/s/1_000_000.0 if b>0 else 0.0)')"
+
+          # ---------- PIP measurement ----------
+          python -m pip install -U pip >/dev/null
+
+          rm -rf pip-downloads
+          mkdir -p pip-downloads
+
+          pip_start="$(date +%s.%N)"
+          python -m pip download --dest pip-downloads "${PIP_PACKAGES[@]}"
+          pip_end="$(date +%s.%N)"
+          pip_seconds="$(S="$pip_start" E="$pip_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
+
+          pip_bytes="$(python -c 'import os; print(sum(os.path.getsize(os.path.join(r,f)) for r,_,fs in os.walk("pip-downloads") for f in fs))')"
+          pip_mbps="$(B="$pip_bytes" S="$pip_seconds" python -c 'import os; b=float(os.environ["B"]); s=float(os.environ["S"]); print((b*8.0)/s/1_000_000.0 if b>0 else 0.0)')"
+
+          # ---------- Emit JSON ----------
+          APT_PACKAGES_STR="${APT_PACKAGES[*]}"
+          PIP_PACKAGES_STR="${PIP_PACKAGES[*]}"
+
+          OUTDIR="$outdir" RUNS_ON="${{ matrix.runner }}" \
+          APT_PACKAGES="$APT_PACKAGES_STR" PIP_PACKAGES="$PIP_PACKAGES_STR" \
+          APT_UPDATE_SECONDS="$apt_update_seconds" APT_DOWNLOAD_SECONDS="$apt_download_seconds" \
+          APT_BYTES="$apt_bytes" APT_MBPS="$apt_mbps" \
+          PIP_SECONDS="$pip_seconds" PIP_BYTES="$pip_bytes" PIP_MBPS="$pip_mbps" \
+          python -c 'import json, os, platform, sys, time; data={"timestamp_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),"runner":os.environ.get("RUNNER_NAME"),"runs_on":os.environ.get("RUNS_ON"),"os":platform.platform(),"python":sys.version.split()[0],"apt":{"packages":os.environ["APT_PACKAGES"].split(),"update_seconds":float(os.environ["APT_UPDATE_SECONDS"]),"download_seconds":float(os.environ["APT_DOWNLOAD_SECONDS"]),"download_bytes":int(float(os.environ["APT_BYTES"])),"download_mbps":float(os.environ["APT_MBPS"])},"pip":{"packages":os.environ["PIP_PACKAGES"].split(),"download_seconds":float(os.environ["PIP_SECONDS"]),"download_bytes":int(float(os.environ["PIP_BYTES"])),"download_mbps":float(os.environ["PIP_MBPS"])}}; os.makedirs(os.environ["OUTDIR"], exist_ok=True); out=os.path.join(os.environ["OUTDIR"], "result.json"); open(out,"w",encoding="utf-8").write(json.dumps(data, indent=2, sort_keys=True)); print(json.dumps(data, indent=2, sort_keys=True))'
+
+      - name: Upload results artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandwidth-${{ matrix.runner }}
+          path: bandwidth-results/result.json
+          if-no-files-found: error
+
+  compare:
+    name: Compare results
+    runs-on: ubuntu-latest
+    needs: [measure]
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Compare ubuntu-latest vs ubuntu-22.04-arm
+        shell: python
+        run: |
+          import json, glob
+
+          def load(path):
+            with open(path, "r", encoding="utf-8") as f:
+              return json.load(f)
+
+          files = glob.glob("artifacts/**/result.json", recursive=True)
+          by = {}
+          for f in files:
+            d = load(f)
+            by[d.get("runs_on", "unknown")] = d
+
+          latest = by.get("ubuntu-latest")
+          arm = by.get("ubuntu-22.04-arm")
+          if not latest or not arm:
+            raise SystemExit(f"Missing results. Found keys: {list(by.keys())}")
+
+          def pct(new, old):
+            if old == 0:
+              return None
+            return (new - old) / old * 100.0
+
+          rows = [
+            ("APT package download Mbps", latest["apt"]["download_mbps"], arm["apt"]["download_mbps"]),
+            ("PIP download Mbps", latest["pip"]["download_mbps"], arm["pip"]["download_mbps"]),
+            ("APT update seconds", latest["apt"]["update_seconds"], arm["apt"]["update_seconds"]),
+            ("APT package download seconds", latest["apt"]["download_seconds"], arm["apt"]["download_seconds"]),
+            ("PIP download seconds", latest["pip"]["download_seconds"], arm["pip"]["download_seconds"]),
+          ]
+
+          print("## Bandwidth comparison\n")
+          print("| Metric | ubuntu-latest | ubuntu-22.04-arm | arm vs latest |")
+          print("|---|---:|---:|---:|")
+          for name, v_latest, v_arm in rows:
+            p = pct(v_arm, v_latest)
+            ptxt = "n/a" if p is None else f"{p:+.1f}%"
+            print(f"| {name} | {v_latest:.3f} | {v_arm:.3f} | {ptxt} |")
