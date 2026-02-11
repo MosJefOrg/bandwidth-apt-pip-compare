@@ -1,4 +1,4 @@
-name: Bandwidth test (apt + pip) across runners
+name: Bandwidth test (apt + pip + speedtest.net) across runners
 
 on:
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Measure APT (package downloads) and PIP download speeds
+      - name: Measure APT (package downloads), PIP, and speedtest.net
         shell: bash
         run: |
           set -euo pipefail
@@ -30,16 +30,10 @@ jobs:
           outdir="bandwidth-results"
           mkdir -p "$outdir"
 
-          # Pick packages that are usually NOT preinstalled on GitHub-hosted runners,
-          # so "download-only install" actually downloads .deb payloads.
-          #
-          # If you find these are already present in your environment, swap to e.g.
-          # ("linux-tools-common" "linux-tools-generic" "clang" "lld").
           APT_PACKAGES=("clang" "cmake" "ninja-build" "pkg-config")
           PIP_PACKAGES=("requests==2.31.0" "numpy==1.26.4" "cryptography==42.0.2")
 
           # ---------- APT measurement (package downloads) ----------
-          # Clean first so counting /var/cache/apt/archives/*.deb reflects THIS run.
           sudo rm -rf /var/lib/apt/lists/*
           sudo apt-get clean
           sudo rm -f /var/cache/apt/archives/*.deb || true
@@ -49,13 +43,11 @@ jobs:
           apt_update_end="$(date +%s.%N)"
           apt_update_seconds="$(S="$apt_update_start" E="$apt_update_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
 
-          # Download-only install (-d). This fetches .deb files without installing.
           apt_download_start="$(date +%s.%N)"
           sudo -E apt-get -y -d install "${APT_PACKAGES[@]}"
           apt_download_end="$(date +%s.%N)"
           apt_download_seconds="$(S="$apt_download_start" E="$apt_download_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
 
-          # Sum bytes of downloaded .deb files
           apt_bytes="$(python -c 'import glob,os; print(sum(os.path.getsize(f) for f in glob.glob("/var/cache/apt/archives/*.deb") if os.path.isfile(f)))')"
           apt_mbps="$(B="$apt_bytes" S="$apt_download_seconds" python -c 'import os; b=float(os.environ["B"]); s=float(os.environ["S"]); print((b*8.0)/s/1_000_000.0 if b>0 else 0.0)')"
 
@@ -73,16 +65,85 @@ jobs:
           pip_bytes="$(python -c 'import os; print(sum(os.path.getsize(os.path.join(r,f)) for r,_,fs in os.walk("pip-downloads") for f in fs))')"
           pip_mbps="$(B="$pip_bytes" S="$pip_seconds" python -c 'import os; b=float(os.environ["B"]); s=float(os.environ["S"]); print((b*8.0)/s/1_000_000.0 if b>0 else 0.0)')"
 
+          # ---------- speedtest.net (Ookla CLI) ----------
+          SPEEDTEST_VERSION="1.2.0"
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64) speedtest_arch="x86_64" ;;
+            aarch64|arm64) speedtest_arch="aarch64" ;;
+            *) echo "Unsupported arch for speedtest: $arch" >&2; exit 1 ;;
+          esac
+
+          tmpdir="$(mktemp -d)"
+          curl -fsSL -o "$tmpdir/speedtest.tgz" "https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_VERSION}-linux-${speedtest_arch}.tgz"
+          tar -C "$tmpdir" -xzf "$tmpdir/speedtest.tgz"
+          sudo install -m 0755 "$tmpdir/speedtest" /usr/local/bin/speedtest
+
+          speedtest_start="$(date +%s.%N)"
+          speedtest_json="$(speedtest --accept-license --accept-gdpr --format=json)"
+          speedtest_end="$(date +%s.%N)"
+          speedtest_seconds="$(S="$speedtest_start" E="$speedtest_end" python -c 'import os; s=float(os.environ["S"]); e=float(os.environ["E"]); print(max(0.001, e-s))')"
+
+          speedtest_download_mbps="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); print((d["download"]["bandwidth"]*8)/1_000_000.0)' <<<"$speedtest_json")"
+          speedtest_upload_mbps="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); print((d["upload"]["bandwidth"]*8)/1_000_000.0)' <<<"$speedtest_json")"
+          speedtest_ping_ms="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); print(d["ping"]["latency"])' <<<"$speedtest_json")"
+          speedtest_server_name="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); s=d.get("server",{}); print(s.get("name",""))' <<<"$speedtest_json")"
+          speedtest_server_id="$(python -c 'import json,sys; d=json.loads(sys.stdin.read()); s=d.get("server",{}); print(s.get("id",""))' <<<"$speedtest_json")"
+
           # ---------- Emit JSON ----------
           APT_PACKAGES_STR="${APT_PACKAGES[*]}"
           PIP_PACKAGES_STR="${PIP_PACKAGES[*]}"
+
+          python_payload_file="$outdir/emit_result.py"
+          cat > "$python_payload_file" <<'PY'
+          import json, os, platform, sys, time
+
+          data = {
+            "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "runner": os.environ.get("RUNNER_NAME"),
+            "runs_on": os.environ.get("RUNS_ON"),
+            "os": platform.platform(),
+            "python": sys.version.split()[0],
+            "apt": {
+              "packages": os.environ["APT_PACKAGES"].split(),
+              "update_seconds": float(os.environ["APT_UPDATE_SECONDS"]),
+              "download_seconds": float(os.environ["APT_DOWNLOAD_SECONDS"]),
+              "download_bytes": int(float(os.environ["APT_BYTES"])),
+              "download_mbps": float(os.environ["APT_MBPS"]),
+            },
+            "pip": {
+              "packages": os.environ["PIP_PACKAGES"].split(),
+              "download_seconds": float(os.environ["PIP_SECONDS"]),
+              "download_bytes": int(float(os.environ["PIP_BYTES"])),
+              "download_mbps": float(os.environ["PIP_MBPS"]),
+            },
+            "speedtest": {
+              "seconds": float(os.environ["SPEEDTEST_SECONDS"]),
+              "download_mbps": float(os.environ["SPEEDTEST_DOWNLOAD_MBPS"]),
+              "upload_mbps": float(os.environ["SPEEDTEST_UPLOAD_MBPS"]),
+              "ping_ms": float(os.environ["SPEEDTEST_PING_MS"]),
+              "server": {
+                "id": os.environ.get("SPEEDTEST_SERVER_ID", ""),
+                "name": os.environ.get("SPEEDTEST_SERVER_NAME", ""),
+              }
+            }
+          }
+
+          outdir = os.environ["OUTDIR"]
+          os.makedirs(outdir, exist_ok=True)
+          out = os.path.join(outdir, "result.json")
+          with open(out, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True)
+          print(json.dumps(data, indent=2, sort_keys=True))
+          PY
 
           OUTDIR="$outdir" RUNS_ON="${{ matrix.runner }}" \
           APT_PACKAGES="$APT_PACKAGES_STR" PIP_PACKAGES="$PIP_PACKAGES_STR" \
           APT_UPDATE_SECONDS="$apt_update_seconds" APT_DOWNLOAD_SECONDS="$apt_download_seconds" \
           APT_BYTES="$apt_bytes" APT_MBPS="$apt_mbps" \
           PIP_SECONDS="$pip_seconds" PIP_BYTES="$pip_bytes" PIP_MBPS="$pip_mbps" \
-          python -c 'import json, os, platform, sys, time; data={"timestamp_utc":time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),"runner":os.environ.get("RUNNER_NAME"),"runs_on":os.environ.get("RUNS_ON"),"os":platform.platform(),"python":sys.version.split()[0],"apt":{"packages":os.environ["APT_PACKAGES"].split(),"update_seconds":float(os.environ["APT_UPDATE_SECONDS"]),"download_seconds":float(os.environ["APT_DOWNLOAD_SECONDS"]),"download_bytes":int(float(os.environ["APT_BYTES"])),"download_mbps":float(os.environ["APT_MBPS"])},"pip":{"packages":os.environ["PIP_PACKAGES"].split(),"download_seconds":float(os.environ["PIP_SECONDS"]),"download_bytes":int(float(os.environ["PIP_BYTES"])),"download_mbps":float(os.environ["PIP_MBPS"])}}; os.makedirs(os.environ["OUTDIR"], exist_ok=True); out=os.path.join(os.environ["OUTDIR"], "result.json"); open(out,"w",encoding="utf-8").write(json.dumps(data, indent=2, sort_keys=True)); print(json.dumps(data, indent=2, sort_keys=True))'
+          SPEEDTEST_SECONDS="$speedtest_seconds" SPEEDTEST_DOWNLOAD_MBPS="$speedtest_download_mbps" SPEEDTEST_UPLOAD_MBPS="$speedtest_upload_mbps" SPEEDTEST_PING_MS="$speedtest_ping_ms" SPEEDTEST_SERVER_NAME="$speedtest_server_name" SPEEDTEST_SERVER_ID="$speedtest_server_id" \
+          python "$python_payload_file"
 
       - name: Upload results artifact
         uses: actions/upload-artifact@v4
@@ -129,9 +190,13 @@ jobs:
           rows = [
             ("APT package download Mbps", latest["apt"]["download_mbps"], arm["apt"]["download_mbps"]),
             ("PIP download Mbps", latest["pip"]["download_mbps"], arm["pip"]["download_mbps"]),
+            ("Speedtest download Mbps", latest["speedtest"]["download_mbps"], arm["speedtest"]["download_mbps"]),
+            ("Speedtest upload Mbps", latest["speedtest"]["upload_mbps"], arm["speedtest"]["upload_mbps"]),
+            ("Speedtest ping ms", latest["speedtest"]["ping_ms"], arm["speedtest"]["ping_ms"]),
             ("APT update seconds", latest["apt"]["update_seconds"], arm["apt"]["update_seconds"]),
             ("APT package download seconds", latest["apt"]["download_seconds"], arm["apt"]["download_seconds"]),
             ("PIP download seconds", latest["pip"]["download_seconds"], arm["pip"]["download_seconds"]),
+            ("Speedtest seconds", latest["speedtest"]["seconds"], arm["speedtest"]["seconds"]),
           ]
 
           print("## Bandwidth comparison\n")
